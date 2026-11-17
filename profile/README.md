@@ -27,8 +27,6 @@ Ordem de deploy: `infra-kubernetes` → `infra-database` → `lambda-auth` →
 
 ## Arquitetura final
 
-Diagrama editável: [`arquitetura.drawio`](arquitetura.drawio).
-
 ```mermaid
 flowchart LR
   cliente([Cliente / Atendente])
