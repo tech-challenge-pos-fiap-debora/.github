@@ -84,8 +84,11 @@ flowchart LR
 
 - **Entrada:** um único ALB com prefixo por serviço; o login do cliente passa
   pela Lambda, que emite um JWT assinado com o segredo compartilhado.
-- **Dados:** *database per service*. Identity, billing e stock têm cada um seu
-  database no mesmo RDS PostgreSQL; order usa MongoDB com volume EBS.
+- **Dados:** *database per service*. PostgreSQL no identity, billing e stock
+  porque orçamento, pagamento e reserva FIFO exigem transação. São databases
+  separados no mesmo RDS. MongoDB no order porque a OS muda de forma
+  (serviços, peças, histórico) e não pede essa transação. Ninguém lê o banco
+  do outro.
 - **Comunicação síncrona (HTTP):** apenas consultas que precisam de resposta
   imediata (dados do cliente, catálogo e preço de peças).
 - **Comunicação assíncrona:** tudo que muda estado entre serviços vai por
@@ -97,7 +100,72 @@ flowchart LR
 Não existe orquestrador. Cada serviço reage aos eventos que lhe interessam e
 publica o resultado; o `correlationId` da saga é o id da OS.
 
-**Fluxo feliz**
+### Fluxo feliz (diagrama)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Order as order-service
+  participant SNS as SNS oficina-domain-events
+  participant Billing as billing-service
+  participant Stock as stock-service
+  participant MP as Mercado Pago
+
+  Note over Order: OS em diagnóstico<br/>POST /budget
+
+  Order->>SNS: order.budget.requested
+  SNS->>Billing: fila billing-events
+
+  Billing->>Billing: gera orçamento
+  Billing->>SNS: billing.budget.generated
+  SNS->>Order: OS → WAITING_APPROVAL
+  SNS->>Stock: prepara peças da OS
+
+  Note over Order: cliente aprova orçamento
+
+  Order->>SNS: order.budget.approved
+  SNS->>Billing: orçamento APPROVED
+  SNS->>Stock: reserva FIFO
+
+  Stock->>SNS: stock.reserved
+  SNS->>Billing: cria cobrança
+  Billing->>MP: payment
+  Billing->>SNS: billing.payment.created
+  SNS->>Order: OS → WAITING_PAYMENT
+
+  MP-->>Billing: pagamento confirmado
+  Billing->>SNS: billing.payment.confirmed
+  SNS->>Order: OS → IN_EXECUTION
+  SNS->>Stock: confirma baixa do estoque
+
+  Note over Order: finish → deliver<br/>OS → DELIVERED
+```
+
+### Compensações (diagrama)
+
+```mermaid
+flowchart TB
+  subgraph feliz["Caminho feliz"]
+    A[order.budget.requested] --> B[billing.budget.generated]
+    B --> C[order.budget.approved]
+    C --> D[stock.reserved]
+    D --> E[billing.payment.created]
+    E --> F[billing.payment.confirmed]
+    F --> G[OS IN_EXECUTION → DELIVERED]
+  end
+
+  subgraph falhas["Se algo falha"]
+    B -.->|billing.budget.failed| X1[order cancela a OS]
+    C -.->|order.budget.rejected| X2[billing reprova orçamento<br/>stock libera reserva]
+    C -.->|stock.reservation.failed| X3[billing cancela orçamento<br/>order cancela a OS]
+    E -.->|billing.payment.failed| X4[stock libera reserva<br/>order cancela a OS]
+    G -.->|order.cancelled| X5[billing cancela/estorna<br/>stock libera]
+  end
+
+  X1 & X2 & X3 & X4 & X5 --> Z[OS CANCELLED]
+```
+
+### Fluxo feliz (tabela)
 
 | # | Evento | Publicado por | Quem reage | Efeito |
 |---|---|---|---|---|
@@ -108,7 +176,7 @@ publica o resultado; o `correlationId` da saga é o id da OS.
 | 5 | `billing.payment.created` | billing | order | OS vai para `WAITING_PAYMENT` |
 | 6 | `billing.payment.confirmed` | billing | order, stock | OS vai para `IN_EXECUTION`; reserva vira baixa |
 
-**Compensações**
+### Compensações (tabela)
 
 | Falha | Evento | Compensação |
 |---|---|---|
@@ -118,12 +186,33 @@ publica o resultado; o `correlationId` da saga é o id da OS.
 | Erro ao orçar | `billing.budget.failed` | order cancela a OS |
 | OS cancelada | `order.cancelled` | billing cancela o orçamento e estorna o pagamento; stock libera a reserva |
 
-**Por que coreografia:** são só três participantes e um fluxo linear, então um
-orquestrador seria mais um serviço para manter e um ponto único de falha. Com
-coreografia cada serviço continua dono das próprias regras, os serviços não se
-conhecem (só conhecem os eventos) e um consumidor fora do ar não perde
-mensagens, porque elas ficam na fila SQS. O custo — visão do fluxo espalhada —
-é coberto pelo `correlationId` nos logs e pelo dashboard da saga no New Relic.
+### SNS e SQS do projeto
+
+Um tópico SNS e três filas SQS (uma por consumidor), com *filter policy* no
+atributo `type` da mensagem. Em produção o Terraform cria:
+
+| Recurso | Nome | Papel |
+|---|---|---|
+| SNS | `oficina-domain-events` | fan-out de todos os eventos de domínio |
+| SQS | `order-events` | fila consumida pelo **order** |
+| SQS | `billing-events` | fila consumida pelo **billing** |
+| SQS | `stock-events` | fila consumida pelo **stock** |
+
+Quem escuta o quê:
+
+| Fila | Eventos (filter policy) |
+|---|---|
+| `order-events` | `billing.budget.generated`, `billing.budget.failed`, `billing.payment.created`, `billing.payment.confirmed`, `billing.payment.failed`, `stock.reservation.failed` |
+| `billing-events` | `order.budget.requested`, `order.budget.approved`, `order.budget.rejected`, `order.cancelled`, `stock.reserved`, `stock.reservation.failed` |
+| `stock-events` | `billing.budget.generated`, `order.budget.approved`, `order.budget.rejected`, `order.cancelled`, `billing.payment.confirmed`, `billing.payment.failed` |
+
+No New Relic, a página **Mensageria SNS/SQS** do dashboard lista as publicações
+no tópico e as operações nas filas por serviço.
+
+**Por que coreografia:** três participantes e um fluxo linear. Um orquestrador
+seria mais um serviço e um ponto único de falha. Cada serviço só conhece os
+eventos. Se um consumidor cai, a mensagem fica na fila SQS. O `correlationId`
+(id da OS) junta o fluxo nos logs e no New Relic.
 
 ## Divisão dos microsserviços
 
